@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Proxy Logs</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; margin: 0; background: #0b0b0b; color: #f5f5f5; }
+    header { padding: 12px 16px; background: #161616; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #232323; }
+    header h1 { margin: 0; font-size: 1.05rem; letter-spacing: 0.04em; text-transform: uppercase; color: #fafafa; }
+    header label { font-size: 0.85rem; color: #cfcfcf; display: flex; align-items: center; gap: 6px; }
+    header input { background: #1f1f1f; border: 1px solid #363636; color: #f5f5f5; padding: 4px 8px; width: 80px; border-radius: 4px; }
+    header input:focus { outline: none; border-color: #6c5ce7; box-shadow: 0 0 0 1px #6c5ce7; }
+    header button { background: #2c2c2c; color: #f5f5f5; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 14px; font-size: 0.85rem; cursor: pointer; transition: background 0.15s ease, border 0.15s ease; }
+    header button:hover { background: #3a3a3a; border-color: #6c5ce7; }
+    header button:active { background: #505050; }
+    header #status { font-size: 0.8rem; color: #8f8f8f; }
+    main { padding: 16px; }
+    .log-root { display: flex; flex-direction: column; gap: 12px; }
+    .log-entry { background: #161616; border-radius: 6px; border-left: 3px solid #3e7bfa; padding: 12px 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.35); }
+    .log-entry.response { border-color: #6c5ce7; }
+    .log-entry.request { border-color: #34c759; }
+    .log-entry.error { border-color: #ff453a; }
+    .log-meta { font-size: 0.82rem; color: #d0d0d0; margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 10px; }
+    .log-target { font-size: 0.78rem; color: #9db2ff; word-break: break-all; margin-bottom: 6px; }
+    .tree-root { font-size: 0.84rem; line-height: 1.35; }
+    .tree-root details { margin-left: 16px; }
+    .tree-root details > summary { cursor: pointer; outline: none; list-style: none; position: relative; padding-left: 16px; color: #f0f0f0; }
+    .tree-root details > summary::marker { display: none; }
+    .tree-root details > summary::before { content: '>'; position: absolute; left: 0; color: #888; transition: transform 0.1s linear; }
+    .tree-root details[open] > summary::before { content: 'v'; color: #bbb; }
+    .tree-children { margin-left: 8px; border-left: 1px dashed #2a2a2a; padding-left: 8px; }
+    .tree-leaf { margin-left: 32px; color: #cfcfcf; white-space: pre-wrap; word-break: break-word; }
+    .tree-leaf .key { color: #8ab4ff; }
+    .tree-leaf .string { color: #f0c674; }
+    .tree-leaf .number { color: #7fdcff; }
+    .tree-leaf .boolean { color: #ff9d76; }
+    .tree-leaf .null { color: #999; font-style: italic; }
+    .empty { color: #777; font-size: 0.9rem; }
+    @media (max-width: 640px) {
+      header { flex-direction: column; align-items: flex-start; gap: 12px; }
+      .log-entry { padding: 10px 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>LLM Proxy Logs</h1>
+    <label for="limit">Dernieres entrees
+      <input id="limit" type="number" min="1" max="1000" value="200" />
+    </label>
+    <button id="refresh">Actualiser</button>
+    <span id="status">Chargement...</span>
+  </header>
+  <main>
+    <div id="log-root" class="log-root">
+      <p class="empty">Chargement...</p>
+    </div>
+  </main>
+  <script>
+    const statusEl = document.getElementById('status');
+    const logRoot = document.getElementById('log-root');
+    const limitInput = document.getElementById('limit');
+    const refreshBtn = document.getElementById('refresh');
+    const MAX_LIMIT = 1000;
+    const DEFAULT_LIMIT = 200;
+
+    const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+
+    function clearLogs(message) {
+      logRoot.innerHTML = '';
+      if (message) {
+        const p = document.createElement('p');
+        p.className = 'empty';
+        p.textContent = message;
+        logRoot.appendChild(p);
+      }
+    }
+
+    function formatSummary(key, value) {
+      const prefix = key ? key + ': ' : '';
+      if (Array.isArray(value)) {
+        return prefix + 'Array[' + value.length + ']';
+      }
+      const size = value ? Object.keys(value).length : 0;
+      return prefix + 'Object' + (size ? ' {' + size + '}' : '');
+    }
+
+    function appendValueSpan(parent, value, fallbackText) {
+      const span = document.createElement('span');
+      if (value === null) {
+        span.className = 'null';
+        span.textContent = 'null';
+      } else if (typeof value === 'string') {
+        span.className = 'string';
+        span.textContent = JSON.stringify(value);
+      } else if (typeof value === 'number' || typeof value === 'bigint') {
+        span.className = 'number';
+        span.textContent = String(value);
+      } else if (typeof value === 'boolean') {
+        span.className = 'boolean';
+        span.textContent = value ? 'true' : 'false';
+      } else {
+        span.textContent = fallbackText !== undefined ? fallbackText : JSON.stringify(value);
+      }
+      parent.appendChild(span);
+    }
+
+    function createPrimitiveElement(key, value) {
+      const div = document.createElement('div');
+      div.className = 'tree-leaf';
+      if (key) {
+        const keySpan = document.createElement('span');
+        keySpan.className = 'key';
+        keySpan.textContent = key;
+        div.appendChild(keySpan);
+        div.appendChild(document.createTextNode(': '));
+        appendValueSpan(div, value);
+      } else {
+        appendValueSpan(div, value);
+      }
+      return div;
+    }
+
+    function createTreeNode(key, value, depth = 0) {
+      if (value && typeof value === 'object' && !(value instanceof Date)) {
+        const details = document.createElement('details');
+        details.open = depth < 3;
+        const summary = document.createElement('summary');
+        summary.textContent = formatSummary(key, value);
+        details.appendChild(summary);
+
+        const container = document.createElement('div');
+        container.className = 'tree-children';
+        const entries = Array.isArray(value) ? value.entries() : Object.entries(value);
+        for (const [childKey, childValue] of entries) {
+          const displayKey = Array.isArray(value) ? '[' + childKey + ']' : String(childKey);
+          container.appendChild(createTreeNode(displayKey, childValue, depth + 1));
+        }
+        details.appendChild(container);
+        return details;
+      }
+      return createPrimitiveElement(key, value);
+    }
+
+    function parseIfJsonString(str) {
+      if (typeof str !== 'string') return null;
+      let t = str.trim();
+      // If the whole thing is a JSON-encoded string, unwrap once
+      if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+        try {
+          const unwrapped = JSON.parse(t);
+          if (typeof unwrapped === 'string') t = unwrapped.trim();
+        } catch (_) {}
+      }
+      if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
+        try { return JSON.parse(t); } catch (_) { return null; }
+      }
+      return null;
+    }
+
+    function parseIfSSEText(str) {
+      if (typeof str !== 'string') return null;
+      const lines = str.split(/\r?\n/);
+      const out = [];
+      for (let raw of lines) {
+        if (!raw) continue;
+        let line = raw.trim();
+        if (!line.toLowerCase().startsWith('data:')) continue;
+        let payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        const direct = parseIfJsonString(payload);
+        if (direct !== null) { out.push(direct); continue; }
+        try { out.push(JSON.parse(payload)); } catch (_) { out.push(payload); }
+      }
+      return out.length ? out : null;
+    }
+
+    function mergeSSEEvents(events) {
+      if (!Array.isArray(events)) return events;
+      // Shallow merge of object events, last value wins. If none are objects, return last element.
+      const acc = {};
+      let hasObject = false;
+      for (const e of events) {
+        if (e && typeof e === 'object' && !Array.isArray(e)) {
+          hasObject = true;
+          for (const [k, v] of Object.entries(e)) acc[k] = v;
+        }
+      }
+      if (hasObject) return acc;
+      return events.length ? events[events.length - 1] : null;
+    }
+
+    function sanitizeEntryForTree(entry, parentKey = null) {
+      if (Array.isArray(entry)) {
+        return entry.map((v) => sanitizeEntryForTree(v, parentKey));
+      }
+      if (entry && typeof entry === 'object') {
+        const result = {};
+        for (const [key, value] of Object.entries(entry)) {
+          result[key] = sanitizeEntryForTree(value, key);
+        }
+        return result;
+      }
+      if (typeof entry === 'string') {
+        // If a body/arguments was logged as a JSON or SSE string, parse for tree view
+        const k = (parentKey || '').toLowerCase();
+        const isBodyish = k.includes('body');
+        const isArgs = k.includes('argument');
+        if (isBodyish || isArgs) {
+          const sse = parseIfSSEText(entry);
+          if (sse !== null) return mergeSSEEvents(sse);
+          const parsed = parseIfJsonString(entry);
+          if (parsed !== null) return parsed;
+        }
+      }
+      return entry;
+    }
+
+    function renderEntry(entry) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'log-entry';
+      if (entry.type) wrapper.classList.add(entry.type);
+
+      const meta = document.createElement('div');
+      meta.className = 'log-meta';
+      const parts = [];
+      if (entry.ts) {
+        try {
+          const ts = new Date(entry.ts);
+          parts.push(ts.toLocaleString());
+        } catch (_) {
+          parts.push(String(entry.ts));
+        }
+      }
+      if (entry.type) parts.push(entry.type.toUpperCase());
+      if (entry.route) parts.push(entry.route);
+      if (typeof entry.status !== 'undefined') parts.push('status=' + entry.status);
+      meta.textContent = parts.join(' | ');
+      wrapper.appendChild(meta);
+
+      if (entry.target) {
+        const target = document.createElement('div');
+        target.className = 'log-target';
+        target.textContent = entry.target;
+        wrapper.appendChild(target);
+      }
+
+      const tree = document.createElement('div');
+      tree.className = 'tree-root';
+      tree.appendChild(createTreeNode(null, sanitizeEntryForTree(entry)));
+      wrapper.appendChild(tree);
+
+      return wrapper;
+    }
+
+    function parseTimestamp(ts) {
+      if (!ts) return null;
+      const value = Date.parse(ts);
+      return Number.isFinite(value) ? value : null;
+    }
+
+    function orderEntries(entries) {
+      const groups = new Map();
+      const orphans = [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object') continue;
+        const id = entry.id;
+        if (!id) {
+          orphans.push(entry);
+          continue;
+        }
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id).push(entry);
+      }
+
+      const grouped = Array.from(groups.entries()).map(([id, list]) => {
+        const sorted = list.slice().sort((a, b) => {
+          if (a.type === b.type) {
+            const ta = parseTimestamp(a.ts) ?? 0;
+            const tb = parseTimestamp(b.ts) ?? 0;
+            return ta - tb;
+          }
+          if (a.type === 'request') return -1;
+          if (b.type === 'request') return 1;
+          return 0;
+        });
+        const firstTs = sorted.reduce((min, cur) => {
+          const val = parseTimestamp(cur.ts);
+          if (val === null) return min;
+          if (min === null || val < min) return val;
+          return min;
+        }, null);
+        return { id, ts: firstTs, entries: sorted };
+      });
+
+      grouped.sort((a, b) => {
+        if (a.ts === b.ts) return 0;
+        if (a.ts === null) return 1;
+        if (b.ts === null) return -1;
+        return a.ts - b.ts;
+      });
+
+      orphans.sort((a, b) => {
+        const ta = parseTimestamp(a?.ts) ?? 0;
+        const tb = parseTimestamp(b?.ts) ?? 0;
+        return ta - tb;
+      });
+
+      const ordered = [];
+      for (const group of grouped) {
+        ordered.push(...group.entries);
+      }
+      ordered.push(...orphans);
+      return ordered;
+    }
+
+    function renderLogs(entries) {
+      logRoot.innerHTML = '';
+      if (!entries.length) {
+        clearLogs("Aucune entree enregistree pour l'instant.");
+        return;
+      }
+      const ordered = orderEntries(entries);
+      const fragment = document.createDocumentFragment();
+      for (const entry of ordered) {
+        fragment.appendChild(renderEntry(entry));
+      }
+      logRoot.appendChild(fragment);
+    }
+
+    async function fetchLogs() {
+      const limit = clamp(parseInt(limitInput.value, 10) || DEFAULT_LIMIT, 1, MAX_LIMIT);
+      limitInput.value = String(limit);
+      const params = new URLSearchParams({ limit: String(limit) });
+      try {
+        const resp = await fetch('/logs/data?' + params.toString(), { cache: 'no-store' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        const entries = Array.isArray(data.entries) ? data.entries : [];
+        renderLogs(entries);
+        const now = new Date().toLocaleTimeString();
+        statusEl.textContent = 'Mis a jour: ' + now;
+      } catch (err) {
+        statusEl.textContent = 'Erreur: ' + err.message;
+        clearLogs('Impossible de charger les logs.');
+      }
+    }
+
+    limitInput.addEventListener('change', fetchLogs);
+    refreshBtn.addEventListener('click', fetchLogs);
+    fetchLogs();
+  </script>
+</body>
+</html>
