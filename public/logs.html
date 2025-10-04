@@ -37,6 +37,16 @@
     .tree-leaf .boolean { color: #ff9d76; }
     .tree-leaf .null { color: #999; font-style: italic; }
     .empty { color: #777; font-size: 0.9rem; }
+    .req-prompt { background: #1b1b1b; border: 1px solid #2a2a2a; border-left: 3px solid #34c759; padding: 8px 10px; border-radius: 4px; margin: 6px 0 10px; white-space: pre-wrap; color: #e8e8e8; }
+    .req-prompt .label { color: #9ddaa8; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: inline-block; margin-bottom: 4px; }
+    .req-tokens { background: #1b1b1b; border: 1px solid #2a2a2a; border-left: 3px solid #3e7bfa; padding: 8px 10px; border-radius: 4px; margin: 6px 0 10px; white-space: pre-wrap; color: #e8e8e8; }
+    .req-tokens .label { color: #9db2ff; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: inline-block; margin-bottom: 4px; }
+    .resp-call { background: #1b1b1b; border: 1px solid #2a2a2a; border-left: 3px solid #6c5ce7; padding: 8px 10px; border-radius: 4px; margin: 6px 0 10px; white-space: pre-wrap; color: #e8e8e8; }
+    .resp-call .label { color: #b6a8ff; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: inline-block; margin-bottom: 4px; }
+    .resp-tokens { background: #1b1b1b; border: 1px solid #2a2a2a; border-left: 3px solid #3e7bfa; padding: 8px 10px; border-radius: 4px; margin: 6px 0 10px; white-space: pre-wrap; color: #e8e8e8; }
+    .resp-tokens .label { color: #9db2ff; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: inline-block; margin-bottom: 4px; }
+    .resp-text { background: #1b1b1b; border: 1px solid #2a2a2a; border-left: 3px solid #6c5ce7; padding: 8px 10px; border-radius: 4px; margin: 6px 0 10px; white-space: pre-wrap; color: #e8e8e8; }
+    .resp-text .label { color: #b6a8ff; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: inline-block; margin-bottom: 4px; }
     @media (max-width: 640px) {
       header { flex-direction: column; align-items: flex-start; gap: 12px; }
       .log-entry { padding: 10px 12px; }
@@ -50,6 +60,7 @@
       <input id="limit" type="number" min="1" max="1000" value="200" />
     </label>
     <button id="refresh">Actualiser</button>
+    <button id="clear">Supprimer les logs</button>
     <span id="status">Chargement...</span>
   </header>
   <main>
@@ -62,6 +73,7 @@
     const logRoot = document.getElementById('log-root');
     const limitInput = document.getElementById('limit');
     const refreshBtn = document.getElementById('refresh');
+    const clearBtn = document.getElementById('clear');
     const MAX_LIMIT = 1000;
     const DEFAULT_LIMIT = 200;
 
@@ -246,6 +258,180 @@
         wrapper.appendChild(target);
       }
 
+      // For requests: show Count Tokens for countTokens routes, else last user prompt text
+      if (entry.type === 'request') {
+        const hasCountTokens = (
+          (typeof entry.target === 'string' && entry.target.toLowerCase().includes('counttokens')) ||
+          (typeof entry.route === 'string' && entry.route.toLowerCase().includes('counttokens'))
+        );
+        if (hasCountTokens) {
+          const box = document.createElement('div');
+          box.className = 'req-tokens';
+          const label = document.createElement('div');
+          label.className = 'label';
+          label.textContent = 'Count Tokens';
+          box.appendChild(label);
+          wrapper.appendChild(box);
+        } else {
+          const promptText = (() => {
+            try {
+              const contents = entry && entry.body && Array.isArray(entry.body.contents) ? entry.body.contents : [];
+              if (!contents.length) return '';
+              // pick last item with role === 'user'; fallback to first item if none
+              let chosen = null;
+              for (const c of contents) {
+                const r = (c && typeof c.role === 'string') ? c.role.toLowerCase() : '';
+                if (r === 'user') chosen = c; // last one wins
+              }
+              if (!chosen) chosen = contents[0];
+              const parts = Array.isArray(chosen.parts) ? chosen.parts : [];
+              const texts = [];
+              for (const p of parts) {
+                if (!p || typeof p !== 'object') continue;
+                if (typeof p.text === 'string') { texts.push(p.text); continue; }
+                // Fallback: when user part has a functionResponse instead of text
+                const fr = p.functionResponse || p.function_response || null;
+                if (fr && typeof fr.name === 'string' && fr.name) {
+                  texts.push(`[functionResponse: ${fr.name}]`);
+                  continue;
+                }
+              }
+              return texts.join('\n');
+            } catch (_) { return ''; }
+          })();
+          if (promptText) {
+            const promptBox = document.createElement('div');
+            promptBox.className = 'req-prompt';
+            const label = document.createElement('div');
+            label.className = 'label';
+            label.textContent = 'User Prompt';
+            promptBox.appendChild(label);
+            promptBox.appendChild(document.createTextNode(promptText));
+            wrapper.appendChild(promptBox);
+          }
+        }
+      }
+
+      // For responses: show last candidate's last part functionCall name
+      if (entry.type === 'response') {
+        let previewShown = false;
+        const fnName = (() => {
+          try {
+            // Normalize body to object: handle SSE strings and JSON strings
+            const rawBody = entry && entry.body;
+            let body = rawBody;
+            if (typeof rawBody === 'string') {
+              const sse = parseIfSSEText(rawBody);
+              if (sse !== null) body = mergeSSEEvents(sse);
+              else {
+                const parsed = parseIfJsonString(rawBody);
+                if (parsed !== null) body = parsed;
+              }
+            }
+            if (!body || typeof body !== 'object') return '';
+            const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+            if (!candidates.length) return '';
+            const lastCand = candidates[candidates.length - 1] || {};
+            const content = lastCand.content || {};
+            const parts = Array.isArray(content.parts) ? content.parts : [];
+            if (!parts.length) return '';
+            let last = parts[parts.length - 1] || {};
+            let fc = last.functionCall || last.function_call;
+            if (!fc) {
+              for (let i = parts.length - 1; i >= 0; i--) {
+                const p = parts[i];
+                if (p && (p.functionCall || p.function_call)) { fc = p.functionCall || p.function_call; break; }
+              }
+            }
+            const name = fc && typeof fc.name === 'string' ? fc.name : '';
+            return name || '';
+          } catch (_) { return ''; }
+        })();
+        if (fnName) {
+          const box = document.createElement('div');
+          box.className = 'resp-call';
+          const label = document.createElement('div');
+          label.className = 'label';
+          label.textContent = 'Function Call';
+          box.appendChild(label);
+          box.appendChild(document.createTextNode(fnName));
+          wrapper.appendChild(box);
+          previewShown = true;
+        }
+
+        // When route includes countTokens, show Count Tokens + body.totalTokens
+        const hasCountTokens = typeof entry.route === 'string' && entry.route.toLowerCase().includes('counttokens');
+        if (hasCountTokens) {
+          // Normalize body similarly
+          let tokensVal = '';
+          try {
+            let bodyObj = entry.body;
+            if (typeof bodyObj === 'string') {
+              const sse = parseIfSSEText(bodyObj);
+              if (sse !== null) bodyObj = mergeSSEEvents(sse);
+              else {
+                const parsed = parseIfJsonString(bodyObj);
+                if (parsed !== null) bodyObj = parsed;
+              }
+            }
+            if (bodyObj && typeof bodyObj === 'object') {
+              const v = bodyObj.totalTokens;
+              if (typeof v === 'number') tokensVal = String(v);
+            }
+          } catch (_) {}
+          if (tokensVal) {
+            const tbox = document.createElement('div');
+            tbox.className = 'resp-tokens';
+            const tlabel = document.createElement('div');
+            tlabel.className = 'label';
+            tlabel.textContent = 'Count Tokens';
+            tbox.appendChild(tlabel);
+            tbox.appendChild(document.createTextNode(tokensVal));
+            wrapper.appendChild(tbox);
+            previewShown = true;
+          }
+        }
+
+        // If no functionCall and no token count preview, show last candidate's text parts
+        if (!previewShown) {
+          const lastText = (() => {
+            try {
+              let bodyObj = entry.body;
+              if (typeof bodyObj === 'string') {
+                const sse = parseIfSSEText(bodyObj);
+                if (sse !== null) bodyObj = mergeSSEEvents(sse);
+                else {
+                  const parsed = parseIfJsonString(bodyObj);
+                  if (parsed !== null) bodyObj = parsed;
+                }
+              }
+              if (!bodyObj || typeof bodyObj !== 'object') return '';
+              const candidates = Array.isArray(bodyObj.candidates) ? bodyObj.candidates : [];
+              if (!candidates.length) return '';
+              const lastCand = candidates[candidates.length - 1] || {};
+              const content = lastCand.content || {};
+              const parts = Array.isArray(content.parts) ? content.parts : [];
+              if (!parts.length) return '';
+              const texts = [];
+              for (const p of parts) {
+                if (p && typeof p.text === 'string') texts.push(p.text);
+              }
+              return texts.join('\n');
+            } catch (_) { return ''; }
+          })();
+          if (lastText) {
+            const box = document.createElement('div');
+            box.className = 'resp-text';
+            const label = document.createElement('div');
+            label.className = 'label';
+            label.textContent = 'Assistant';
+            box.appendChild(label);
+            box.appendChild(document.createTextNode(lastText));
+            wrapper.appendChild(box);
+          }
+        }
+      }
+
       const tree = document.createElement('div');
       tree.className = 'tree-root';
       tree.appendChild(createTreeNode(null, sanitizeEntryForTree(entry)));
@@ -349,6 +535,21 @@
 
     limitInput.addEventListener('change', fetchLogs);
     refreshBtn.addEventListener('click', fetchLogs);
+    clearBtn.addEventListener('click', async () => {
+      if (!confirm('Supprimer tous les logs ?')) return;
+      const prev = clearBtn.textContent;
+      clearBtn.disabled = true; clearBtn.textContent = 'Suppression...';
+      try {
+        const resp = await fetch('/logs/data', { method: 'DELETE' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        await fetchLogs();
+        statusEl.textContent = 'Logs supprimes';
+      } catch (err) {
+        statusEl.textContent = 'Erreur suppression: ' + err.message;
+      } finally {
+        clearBtn.disabled = false; clearBtn.textContent = prev;
+      }
+    });
     fetchLogs();
   </script>
 </body>

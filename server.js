@@ -22,7 +22,7 @@ app.use(express.json({ limit: '5mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, OpenAI-Organization, OpenAI-Project, OpenAI-Beta');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -507,6 +507,20 @@ app.get('/logs/data', async (req, res) => {
   } catch (err) {
     console.error('[logs] Failed to read log file:', err);
     res.status(500).json({ error: 'Failed to read logs', detail: err.message });
+  }
+});
+
+app.delete('/logs/data', async (_req, res) => {
+  try {
+    await fsp.writeFile(LOG_FILE, '');
+    res.json({ ok: true });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      // Nothing to clear
+      return res.json({ ok: true });
+    }
+    console.error('[logs] Failed to clear log file:', err);
+    res.status(500).json({ error: 'Failed to clear logs', detail: err.message });
   }
 });
 
